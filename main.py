@@ -1,14 +1,42 @@
 import sys
+import os
 import random
+import traceback
 from datetime import datetime
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QListWidget, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QTextEdit, QLineEdit, QComboBox, QMessageBox,
-    QHeaderView, QFormLayout, QAbstractItemView
-)
-from PySide6.QtCore import QTimer
+# ============ 调试日志 ============
+LOG_PATH = os.path.join(os.path.expanduser("~"), "DiagTool_debug.log")
+
+def log_file(msg):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+log_file("========== 程序启动 ==========")
+log_file(f"Python: {sys.version}")
+log_file(f"frozen: {getattr(sys, 'frozen', False)}")
+log_file(f"exe: {sys.executable}")
+
+# 设置 Qt 平台插件路径（PyInstaller onefile 兼容）
+if getattr(sys, "frozen", False):
+    base = sys._MEIPASS
+    os.environ["QT_PLUGIN_PATH"] = os.path.join(base, "PySide6", "plugins")
+    log_file(f"QT_PLUGIN_PATH = {os.environ['QT_PLUGIN_PATH']}")
+
+try:
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPushButton, QLabel, QListWidget, QStackedWidget, QTableWidget,
+        QTableWidgetItem, QTextEdit, QLineEdit, QComboBox, QMessageBox,
+        QHeaderView, QFormLayout, QAbstractItemView
+    )
+    from PySide6.QtCore import QTimer, Qt
+    log_file("PySide6 导入成功")
+except Exception:
+    log_file("PySide6 导入失败:\n" + traceback.format_exc())
+    sys.exit(1)
 
 
 class MockECU:
@@ -92,13 +120,13 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_data_stream)
         self.init_ui()
         self.log("程序启动，当前为模拟模式")
+        log_file("MainWindow 初始化完成")
 
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
 
-        # 左侧菜单
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("功能菜单"))
         self.menu = QListWidget()
@@ -108,10 +136,8 @@ class MainWindow(QMainWindow):
         left_layout.addStretch()
         main_layout.addLayout(left_layout)
 
-        # 右侧
         right_layout = QVBoxLayout()
 
-        # 顶部状态栏
         top_bar = QHBoxLayout()
         self.btn_connect = QPushButton("连接")
         self.btn_connect.clicked.connect(self.toggle_connection)
@@ -126,7 +152,6 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.voltage_label)
         right_layout.addLayout(top_bar)
 
-        # 页面栈
         self.stack = QStackedWidget()
         self.stack.addWidget(self.create_dtc_page())
         self.stack.addWidget(self.create_freeze_page())
@@ -135,7 +160,6 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.create_settings_page())
         right_layout.addWidget(self.stack)
 
-        # 日志
         right_layout.addWidget(QLabel("日志"))
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -345,8 +369,32 @@ class MainWindow(QMainWindow):
         self.log_text.append(f"[{t}] {msg}")
 
 
+def main():
+    try:
+        log_file("创建 QApplication")
+        app = QApplication(sys.argv)
+        log_file("QApplication 创建成功")
+
+        window = MainWindow()
+        log_file("MainWindow 创建成功")
+
+        # 关键：强制窗口居中、置顶、激活
+        screen = app.primaryScreen().availableGeometry()
+        w, h = 1200, 800
+        x = (screen.width() - w) // 2
+        y = (screen.height() - h) // 2
+        window.move(x, y)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        window.setWindowState(window.windowState() | Qt.WindowActive)
+        log_file(f"窗口已显示，位置=({x},{y})，尺寸=({w},{h})")
+
+        sys.exit(app.exec())
+    except Exception:
+        log_file("主程序异常:\n" + traceback.format_exc())
+        raise
+
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    main()
