@@ -4,8 +4,8 @@ import random
 import traceback
 from datetime import datetime
 
-# ============ 调试日志 ============
 LOG_PATH = os.path.join(os.path.expanduser("~"), "DiagTool_debug.log")
+
 
 def log_file(msg):
     try:
@@ -14,113 +14,198 @@ def log_file(msg):
     except Exception:
         pass
 
-log_file("========== 程序启动 ==========")
-log_file(f"Python: {sys.version}")
-log_file(f"frozen: {getattr(sys, 'frozen', False)}")
-log_file(f"exe: {sys.executable}")
 
-# 设置 Qt 平台插件路径（PyInstaller onefile 兼容）
+log_file("========== 程序启动 ==========")
+
 if getattr(sys, "frozen", False):
     base = sys._MEIPASS
     os.environ["QT_PLUGIN_PATH"] = os.path.join(base, "PySide6", "plugins")
-    log_file(f"QT_PLUGIN_PATH = {os.environ['QT_PLUGIN_PATH']}")
 
-try:
-    from PySide6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QPushButton, QLabel, QListWidget, QStackedWidget, QTableWidget,
-        QTableWidgetItem, QTextEdit, QLineEdit, QComboBox, QMessageBox,
-        QHeaderView, QFormLayout, QAbstractItemView
-    )
-    from PySide6.QtCore import QTimer, Qt
-    log_file("PySide6 导入成功")
-except Exception:
-    log_file("PySide6 导入失败:\n" + traceback.format_exc())
-    sys.exit(1)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QListWidget, QStackedWidget, QTableWidget,
+    QTableWidgetItem, QTextEdit, QLineEdit, QComboBox, QMessageBox,
+    QHeaderView, QFormLayout, QAbstractItemView, QGroupBox
+)
+from PySide6.QtCore import QTimer, Qt
+
+from can_adapter import create_adapter, VENDORS, BITRATES
+from uds_client import UdsClient, UdsError, UdsNegativeResponse
 
 
-class MockECU:
+# ============================================================
+# 后端 1: 模拟 ECU（离线测试用）
+# ============================================================
+class MockBackend:
+    name = "模拟"
+
     def __init__(self):
         self.connected = False
         self.dtcs = [
-            {"code": "P0301", "status": "当前故障", "desc": "1缸失火"},
-            {"code": "P0420", "status": "历史故障", "desc": "催化器效率低"},
-            {"code": "U0100", "status": "当前故障", "desc": "与ECM通讯丢失"},
+            ("P0301", 0x09, "1 缸失火"),
+            ("P0420", 0x08, "催化器效率低"),
+            ("U0100", 0x09, "与 ECM 通讯丢失"),
         ]
-        self.freeze_frames = {
-            "P0301": [
-                ("发动机转速", "3200", "rpm"),
-                ("车速", "45", "km/h"),
-                ("冷却液温度", "92", "°C"),
-                ("进气歧管压力", "45", "kPa"),
-            ],
-            "P0420": [
-                ("发动机转速", "2200", "rpm"),
-                ("车速", "60", "km/h"),
-                ("冷却液温度", "88", "°C"),
-                ("催化器温度", "450", "°C"),
-            ],
-            "U0100": [
-                ("发动机转速", "0", "rpm"),
-                ("车速", "0", "km/h"),
-                ("蓄电池电压", "11.8", "V"),
-            ],
+        self.freeze = {
+            "P0301": [("发动机转速", "3200", "rpm"),
+                      ("车速", "45", "km/h"),
+                      ("冷却液温度", "92", "°C")],
+            "P0420": [("发动机转速", "2200", "rpm"),
+                      ("车速", "60", "km/h"),
+                      ("催化器温度", "450", "°C")],
+            "U0100": [("蓄电池电压", "11.8", "V")],
         }
-        self.data_stream = [
-            {"did": "0xF190", "name": "VIN", "value": "LSVAA1234567890", "unit": ""},
-            {"did": "0xF191", "name": "发动机转速", "value": "800", "unit": "rpm"},
-            {"did": "0xF192", "name": "车速", "value": "0", "unit": "km/h"},
-            {"did": "0xF193", "name": "冷却液温度", "value": "90", "unit": "°C"},
-            {"did": "0xF194", "name": "节气门位置", "value": "12.5", "unit": "%"},
-            {"did": "0xF195", "name": "蓄电池电压", "value": "13.8", "unit": "V"},
+        self.live = [
+            {"did": 0xF190, "name": "VIN", "value": "LSVAA1234567890", "unit": ""},
+            {"did": 0xF191, "name": "发动机转速", "value": "800", "unit": "rpm"},
+            {"did": 0xF192, "name": "车速", "value": "0", "unit": "km/h"},
+            {"did": 0xF193, "name": "冷却液温度", "value": "90", "unit": "°C"},
+            {"did": 0xF194, "name": "节气门位置", "value": "12.5", "unit": "%"},
+            {"did": 0xF195, "name": "蓄电池电压", "value": "13.8", "unit": "V"},
         ]
         self.params = {}
 
-    def connect(self):
+    def connect(self, cfg):
         self.connected = True
 
     def disconnect(self):
         self.connected = False
 
     def read_dtcs(self):
-        return self.dtcs
+        return [(c, f"0x{s:02X}", d) for c, s, d in self.dtcs]
 
     def clear_dtcs(self):
         self.dtcs = []
 
     def read_freeze_frame(self, code):
-        return self.freeze_frames.get(code, [])
+        return self.freeze.get(code, [])
 
     def read_data_stream(self):
-        for item in self.data_stream:
-            if item["name"] == "发动机转速":
+        for item in self.live:
+            n = item["name"]
+            if n == "发动机转速":
                 item["value"] = str(random.randint(750, 3500))
-            elif item["name"] == "车速":
+            elif n == "车速":
                 item["value"] = str(random.randint(0, 120))
-            elif item["name"] == "冷却液温度":
+            elif n == "冷却液温度":
                 item["value"] = str(random.randint(80, 105))
-            elif item["name"] == "节气门位置":
+            elif n == "节气门位置":
                 item["value"] = f"{random.uniform(0, 100):.1f}"
-            elif item["name"] == "蓄电池电压":
+            elif n == "蓄电池电压":
                 item["value"] = f"{random.uniform(12.0, 14.5):.2f}"
-        return self.data_stream
+        return self.live
 
     def write_param(self, did, value):
         self.params[did] = value
         return True
 
 
+# ============================================================
+# 后端 2: 真实 UDS
+# ============================================================
+class UdsBackend:
+    name = "UDS"
+
+    def __init__(self):
+        self.adapter = None
+        self.client = None
+        self.connected = False
+
+    def connect(self, cfg):
+        self.adapter = create_adapter(
+            cfg["vendor"], cfg["channel"], cfg["bitrate"])
+        self.adapter.open()
+        self.client = UdsClient(
+            self.adapter,
+            tx_id=cfg["tx_id"],
+            rx_id=cfg["rx_id"],
+            func_id=cfg["func_id"],
+        )
+        self.connected = True
+
+    def disconnect(self):
+        if self.adapter is not None:
+            try:
+                self.adapter.close()
+            except Exception:
+                pass
+        self.adapter = None
+        self.client = None
+        self.connected = False
+
+    # ------- 以下每个方法都调用 UdsClient，可以自行修改 -------
+    def read_dtcs(self):
+        result = self.client.read_dtc_by_status_mask(0xFF)
+        return [(code, f"0x{st:02X}", "") for code, st in result]
+
+    def clear_dtcs(self):
+        self.client.clear_diagnostic_information(0xFFFFFF)
+
+    def read_freeze_frame(self, code):
+        # 简化实现：以固定 DID 读取，需按你的 ECU 修改
+        # 这里示范读 0xF191/0xF192/0xF193
+        items = []
+        for did, name, unit in [
+            (0xF191, "发动机转速", "rpm"),
+            (0xF192, "车速", "km/h"),
+            (0xF193, "冷却液温度", "°C"),
+        ]:
+            try:
+                raw = self.client.read_data_by_identifier(did)
+                items.append((name, raw.hex(" ").upper(), unit))
+            except UdsError as e:
+                items.append((name, f"错误: {e}", unit))
+        return items
+
+    def read_data_stream(self):
+        result = []
+        # 需要按你的 ECU 修改 DID 列表
+        did_list = [
+            (0xF190, "VIN", ""),
+            (0xF191, "发动机转速", "rpm"),
+            (0xF192, "车速", "km/h"),
+            (0xF193, "冷却液温度", "°C"),
+        ]
+        for did, name, unit in did_list:
+            try:
+                raw = self.client.read_data_by_identifier(did)
+                if did == 0xF190:
+                    value = raw.decode("ascii", errors="replace").strip("\x00")
+                elif len(raw) == 1:
+                    value = str(raw[0])
+                elif len(raw) == 2:
+                    value = str((raw[0] << 8) | raw[1])
+                else:
+                    value = raw.hex(" ").upper()
+            except UdsError as e:
+                value = f"错误: {e}"
+            result.append({"did": did, "name": name, "value": value, "unit": unit})
+        return result
+
+    def write_param(self, did_str, value_str):
+        did = int(did_str.replace("0x", "").replace("0X", ""), 16)
+        # 简化：按 ASCII 写入。要写数值，请自行按字节序转换。
+        try:
+            value_bytes = value_str.encode("ascii")
+        except Exception:
+            value_bytes = bytes.fromhex(value_str.replace(" ", ""))
+        self.client.write_data_by_identifier(did, value_bytes)
+        return True
+
+
+# ============================================================
+# 主窗口
+# ============================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.ecu = MockECU()
-        self.setWindowTitle("UDS 汽车诊断仪 - 模拟模式")
+        self.backend = MockBackend()
+        self.setWindowTitle("UDS 汽车诊断仪")
         self.resize(1200, 800)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_data_stream)
         self.init_ui()
         self.log("程序启动，当前为模拟模式")
-        log_file("MainWindow 初始化完成")
 
     def init_ui(self):
         central = QWidget()
@@ -130,7 +215,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("功能菜单"))
         self.menu = QListWidget()
-        self.menu.addItems(["故障码", "冻结帧", "数据流", "参数写入", "系统设置"])
+        self.menu.addItems(["连接设置", "故障码", "冻结帧", "数据流", "参数写入", "关于"])
         self.menu.setFixedWidth(180)
         left_layout.addWidget(self.menu)
         left_layout.addStretch()
@@ -153,11 +238,12 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(top_bar)
 
         self.stack = QStackedWidget()
+        self.stack.addWidget(self.create_conn_page())
         self.stack.addWidget(self.create_dtc_page())
         self.stack.addWidget(self.create_freeze_page())
         self.stack.addWidget(self.create_data_page())
         self.stack.addWidget(self.create_write_page())
-        self.stack.addWidget(self.create_settings_page())
+        self.stack.addWidget(self.create_about_page())
         right_layout.addWidget(self.stack)
 
         right_layout.addWidget(QLabel("日志"))
@@ -176,6 +262,57 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+    # -------- 页面: 连接设置 --------
+    def create_conn_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        # 模式
+        mode_group = QGroupBox("模式")
+        mode_layout = QFormLayout(mode_group)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["模拟（离线测试）", "真实 UDS（连接硬件）"])
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        mode_layout.addRow("运行模式:", self.mode_combo)
+        layout.addWidget(mode_group)
+
+        # CAN 配置
+        can_group = QGroupBox("CAN 通讯配置")
+        can_layout = QFormLayout(can_group)
+        self.vendor_combo = QComboBox()
+        self.vendor_combo.addItems(VENDORS)
+        can_layout.addRow("CAN 盒厂商:", self.vendor_combo)
+
+        self.channel_input = QLineEdit()
+        self.channel_input.setPlaceholderText("PCAN: PCAN_USBBUS1  |  Kvaser: 0  |  ZLG: 0")
+        can_layout.addRow("通道:", self.channel_input)
+
+        self.bitrate_combo = QComboBox()
+        for b in BITRATES:
+            self.bitrate_combo.addItem(f"{b // 1000} kbps", b)
+        self.bitrate_combo.setCurrentIndex(1)  # 默认 500k
+        can_layout.addRow("波特率:", self.bitrate_combo)
+
+        self.tx_input = QLineEdit("0x7E0")
+        self.rx_input = QLineEdit("0x7E8")
+        self.func_input = QLineEdit("0x7DF")
+        can_layout.addRow("物理请求 ID:", self.tx_input)
+        can_layout.addRow("物理响应 ID:", self.rx_input)
+        can_layout.addRow("功能寻址 ID:", self.func_input)
+
+        layout.addWidget(can_group)
+
+        # 按钮
+        btn_row = QHBoxLayout()
+        self.btn_apply = QPushButton("应用并连接")
+        self.btn_apply.clicked.connect(self.toggle_connection)
+        btn_row.addWidget(self.btn_apply)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        layout.addStretch()
+        return page
 
     def create_dtc_page(self):
         page = QWidget()
@@ -235,7 +372,7 @@ class MainWindow(QMainWindow):
         self.did_input = QLineEdit()
         self.did_input.setPlaceholderText("例如 0xF190")
         self.value_input = QLineEdit()
-        self.value_input.setPlaceholderText("例如 1234 或 文本")
+        self.value_input.setPlaceholderText("ASCII 文本，或十六进制如 01 02 03")
         form.addRow("DID:", self.did_input)
         form.addRow("值:", self.value_input)
         layout.addLayout(form)
@@ -245,70 +382,126 @@ class MainWindow(QMainWindow):
         self.btn_write.clicked.connect(self.write_param)
         return page
 
-    def create_settings_page(self):
+    def create_about_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("通讯配置（模拟模式）"))
-        layout.addWidget(QLabel("CAN ID: 0x7E0 / 0x7E8"))
-        layout.addWidget(QLabel("波特率: 500 kbps"))
-        layout.addWidget(QLabel("协议: UDS over ISO-TP"))
-        layout.addWidget(QLabel("后续接入真实硬件时，请在此配置 PCAN/Kvaser/Vector 等参数。"))
+        layout.addWidget(QLabel("UDS 诊断仪 - 多厂商 CAN 版"))
+        layout.addWidget(QLabel("支持厂商: " + "、".join(VENDORS)))
+        layout.addWidget(QLabel("波特率: 250 kbps / 500 kbps"))
+        layout.addWidget(QLabel("默认寻址: 物理 0x7E0 / 0x7E8，功能 0x7DF"))
+        layout.addWidget(QLabel("UDS 服务在 uds_client.py 中，可自由扩展"))
         layout.addStretch()
         return page
 
+    # -------- 交互 --------
+    def on_mode_changed(self, idx):
+        if self.backend.connected:
+            QMessageBox.warning(self, "提示", "请先断开当前连接再切换模式")
+            return
+        if idx == 0:
+            self.backend = MockBackend()
+            self.log("已切换到模拟模式")
+        else:
+            self.backend = UdsBackend()
+            self.log("已切换到真实 UDS 模式")
+
+    def _parse_hex(self, s, default):
+        try:
+            return int(s.strip().replace("0x", "").replace("0X", ""), 16)
+        except Exception:
+            return default
+
     def toggle_connection(self):
-        if self.ecu.connected:
-            self.ecu.disconnect()
+        if self.backend.connected:
+            try:
+                self.backend.disconnect()
+            except Exception as e:
+                self.log(f"断开时出错: {e}")
+            self.backend.connected = False
             self.btn_connect.setText("连接")
             self.status_label.setText("未连接")
             self.status_label.setStyleSheet("color: red;")
-            self.log("已断开 ECU")
+            self.log("已断开")
             self.timer.stop()
-        else:
-            self.ecu.connect()
-            self.btn_connect.setText("断开")
-            self.status_label.setText("已连接")
+            return
+
+        cfg = {
+            "vendor": self.vendor_combo.currentText(),
+            "channel": self.channel_input.text().strip(),
+            "bitrate": self.bitrate_combo.currentData(),
+            "tx_id": self._parse_hex(self.tx_input.text(), 0x7E0),
+            "rx_id": self._parse_hex(self.rx_input.text(), 0x7E8),
+            "func_id": self._parse_hex(self.func_input.text(), 0x7DF),
+        }
+        try:
+            self.backend.connect(cfg)
+            self.status_label.setText(f"已连接 [{self.backend.name}]")
             self.status_label.setStyleSheet("color: green;")
-            self.log("已连接 ECU (模拟)")
+            self.btn_connect.setText("断开")
+            self.log(f"连接成功: {cfg}")
             self.load_freeze_codes()
-            self.update_vehicle_info()
+        except NotImplementedError as e:
+            QMessageBox.warning(self, "未实现", str(e))
+            self.log(f"适配器未实现: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "连接失败", str(e))
+            self.log(f"连接失败: {e}\n{traceback.format_exc()}")
 
     def load_freeze_codes(self):
         self.freeze_combo.clear()
-        for dtc in self.ecu.read_dtcs():
-            self.freeze_combo.addItem(dtc["code"])
+        try:
+            for code, _, _ in self.backend.read_dtcs():
+                self.freeze_combo.addItem(code)
+        except Exception as e:
+            self.log(f"加载故障码失败: {e}")
 
     def read_dtcs(self):
-        if not self.ecu.connected:
-            QMessageBox.warning(self, "提示", "请先连接 ECU")
+        if not self.backend.connected:
+            QMessageBox.warning(self, "提示", "请先连接")
             return
-        dtcs = self.ecu.read_dtcs()
+        try:
+            dtcs = self.backend.read_dtcs()
+        except Exception as e:
+            self.log(f"读取故障码失败: {e}")
+            QMessageBox.critical(self, "错误", str(e))
+            return
         self.dtc_table.setRowCount(0)
-        for row, dtc in enumerate(dtcs):
+        for row, (code, status, desc) in enumerate(dtcs):
             self.dtc_table.insertRow(row)
-            self.dtc_table.setItem(row, 0, QTableWidgetItem(dtc["code"]))
-            self.dtc_table.setItem(row, 1, QTableWidgetItem(dtc["status"]))
-            self.dtc_table.setItem(row, 2, QTableWidgetItem(dtc["desc"]))
+            self.dtc_table.setItem(row, 0, QTableWidgetItem(code))
+            self.dtc_table.setItem(row, 1, QTableWidgetItem(status))
+            self.dtc_table.setItem(row, 2, QTableWidgetItem(desc))
+        self.load_freeze_codes()
         self.log(f"读取故障码完成，共 {len(dtcs)} 条")
 
     def clear_dtcs(self):
-        if not self.ecu.connected:
-            QMessageBox.warning(self, "提示", "请先连接 ECU")
+        if not self.backend.connected:
+            QMessageBox.warning(self, "提示", "请先连接")
             return
-        self.ecu.clear_dtcs()
+        try:
+            self.backend.clear_dtcs()
+        except Exception as e:
+            self.log(f"清除故障码失败: {e}")
+            QMessageBox.critical(self, "错误", str(e))
+            return
         self.dtc_table.setRowCount(0)
         self.load_freeze_codes()
         self.log("已清除故障码")
 
     def read_freeze(self):
-        if not self.ecu.connected:
-            QMessageBox.warning(self, "提示", "请先连接 ECU")
+        if not self.backend.connected:
+            QMessageBox.warning(self, "提示", "请先连接")
             return
         code = self.freeze_combo.currentText()
         if not code:
             QMessageBox.warning(self, "提示", "没有可读取的故障码")
             return
-        data = self.ecu.read_freeze_frame(code)
+        try:
+            data = self.backend.read_freeze_frame(code)
+        except Exception as e:
+            self.log(f"读取冻结帧失败: {e}")
+            QMessageBox.critical(self, "错误", str(e))
+            return
         self.freeze_table.setRowCount(0)
         for row, (item, value, unit) in enumerate(data):
             self.freeze_table.insertRow(row)
@@ -318,8 +511,8 @@ class MainWindow(QMainWindow):
         self.log(f"读取冻结帧 {code} 完成，共 {len(data)} 项")
 
     def start_data_stream(self):
-        if not self.ecu.connected:
-            QMessageBox.warning(self, "提示", "请先连接 ECU")
+        if not self.backend.connected:
+            QMessageBox.warning(self, "提示", "请先连接")
             return
         self.timer.start(500)
         self.log("开始读取数据流")
@@ -329,21 +522,24 @@ class MainWindow(QMainWindow):
         self.log("停止读取数据流")
 
     def update_data_stream(self):
-        if not self.ecu.connected:
+        if not self.backend.connected:
             self.timer.stop()
             return
-        data = self.ecu.read_data_stream()
+        try:
+            data = self.backend.read_data_stream()
+        except Exception as e:
+            self.log(f"读数据流失败: {e}")
+            return
         self.data_table.setRowCount(0)
         for row, item in enumerate(data):
             self.data_table.insertRow(row)
-            self.data_table.setItem(row, 0, QTableWidgetItem(item["did"]))
+            did = item["did"]
+            did_str = f"0x{did:04X}" if isinstance(did, int) else str(did)
+            self.data_table.setItem(row, 0, QTableWidgetItem(did_str))
             self.data_table.setItem(row, 1, QTableWidgetItem(item["name"]))
-            self.data_table.setItem(row, 2, QTableWidgetItem(item["value"]))
+            self.data_table.setItem(row, 2, QTableWidgetItem(str(item["value"])))
             self.data_table.setItem(row, 3, QTableWidgetItem(item["unit"]))
-        self.update_vehicle_info()
-
-    def update_vehicle_info(self):
-        data = self.ecu.read_data_stream()
+        # 更新 VIN / 电压
         for item in data:
             if item["name"] == "VIN":
                 self.vin_label.setText(f"VIN: {item['value']}")
@@ -351,18 +547,25 @@ class MainWindow(QMainWindow):
                 self.voltage_label.setText(f"电压: {item['value']} V")
 
     def write_param(self):
-        if not self.ecu.connected:
-            QMessageBox.warning(self, "提示", "请先连接 ECU")
+        if not self.backend.connected:
+            QMessageBox.warning(self, "提示", "请先连接")
             return
         did = self.did_input.text().strip()
         value = self.value_input.text().strip()
         if not did or not value:
             QMessageBox.warning(self, "提示", "请输入 DID 和值")
             return
-        if self.ecu.write_param(did, value):
-            self.log(f"参数写入成功: DID={did}, 值={value}")
-        else:
-            self.log(f"参数写入失败: DID={did}")
+        try:
+            ok = self.backend.write_param(did, value)
+        except UdsNegativeResponse as e:
+            self.log(f"参数写入被拒: {e}")
+            QMessageBox.warning(self, "负响应", str(e))
+            return
+        except Exception as e:
+            self.log(f"参数写入失败: {e}")
+            QMessageBox.critical(self, "错误", str(e))
+            return
+        self.log(f"参数写入 {'成功' if ok else '失败'}: DID={did}, 值={value}")
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -371,14 +574,8 @@ class MainWindow(QMainWindow):
 
 def main():
     try:
-        log_file("创建 QApplication")
         app = QApplication(sys.argv)
-        log_file("QApplication 创建成功")
-
         window = MainWindow()
-        log_file("MainWindow 创建成功")
-
-        # 关键：强制窗口居中、置顶、激活
         screen = app.primaryScreen().availableGeometry()
         w, h = 1200, 800
         x = (screen.width() - w) // 2
@@ -388,8 +585,6 @@ def main():
         window.raise_()
         window.activateWindow()
         window.setWindowState(window.windowState() | Qt.WindowActive)
-        log_file(f"窗口已显示，位置=({x},{y})，尺寸=({w},{h})")
-
         sys.exit(app.exec())
     except Exception:
         log_file("主程序异常:\n" + traceback.format_exc())
